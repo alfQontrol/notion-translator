@@ -105,6 +105,9 @@ const supportedToLangs = [
   "TR", // Turkish
   "ZH", // Chinese
 ];
+const databases = [];
+
+const translationOfSelectOptions = true;
 
 const printableSupportedFromLangs = supportedFromLangs
   .map((l) => l.toLowerCase())
@@ -186,7 +189,7 @@ if (debug) {
 // ------------------------
 // Main code
 
-async function buildTranslatedBlocks(id, nestedDepth) {
+async function buildTranslatedBlocks(id, newPage, nestedDepth) {
   const translatedBlocks = [];
   let cursor;
   let hasMore = true;
@@ -316,24 +319,9 @@ async function buildTranslatedBlocks(id, nestedDepth) {
           continue;
         }
       } else if (b.type === "child_database") {
-        // Convert a child_database in the original page to link_to_page
-        try {
-          b.type = "link_to_page";
-          const d = await notion.databases.retrieve({ database_id: b.id });
-          b.link_to_page = {
-            type: "database_id",
-            database_id: d.id,
-          };
-          delete b.child_database;
-          b.has_children = false;
-        } catch (e) {
-          if (debug) {
-            console.log(
-              `Failed to load a database (error: ${e}) - Skipped this block.`
-            );
-          }
-          continue;
-        }
+          // Tweak to keep id from wiping
+          b.internal_db_id = b.id;
+
       } else if (b.has_children) {
         if (nestedDepth >= 3) {
           // https://developers.notion.com/reference/patch-block-children
@@ -341,7 +329,7 @@ async function buildTranslatedBlocks(id, nestedDepth) {
           continue;
         }
         // Recursively call this method for nested children blocks
-        b[b.type].children = await buildTranslatedBlocks(b.id, nestedDepth + 1);
+        b[b.type].children = await buildTranslatedBlocks(b.id, newPage, nestedDepth + 1);
       }
       removeUnecessaryProperties(b);
       // Translate all the text parts in this nest level
@@ -371,11 +359,14 @@ async function buildTranslatedBlocks(id, nestedDepth) {
 async function createNewPageForTranslation(originalPage) {
   const newPage = JSON.parse(JSON.stringify(originalPage)); // Create a deep copy
   // Create the translated page as a child of the original page
-  newPage.parent = { page_id: originalPage.id };
+  //newPage.parent = { page_id: originalPage.id };
+  newPage.parent = { page_id: originalPage.parent.page_id };
   const originalTitle = originalPage.properties.title ? originalPage.properties.title.title[0] : "Translated page";
+  const translatedTitleContent = await translator.translateText(originalTitle.text.content, from, to);
+  const translatedTitlePlainText = await translator.translateText(originalTitle.plain_text, from, to);
   const newTitle = newPage.properties.title.title[0];
-  newTitle.text.content = originalTitle.text.content + ` (${to})`;
-  newTitle.plain_text = originalTitle.plain_text + ` (${to})`;
+  newTitle.text.content = translatedTitleContent.text + ` (${to})`;
+  newTitle.plain_text = translatedTitlePlainText.text + ` (${to})`;
   removeUnecessaryProperties(newPage);
 
   if (debug) {
@@ -417,8 +408,8 @@ async function createNewPageForTranslation(originalPage) {
   process.stdout.write(
     `\nWait a minute! Now translating the following Notion page:\n${url}\n\n(this may take some time) ...`
   );
-  const translatedBlocks = await buildTranslatedBlocks(originalPage.id, 0);
   const newPage = await createNewPageForTranslation(originalPage);
+  const translatedBlocks = await buildTranslatedBlocks(originalPage.id, newPage, 0);
   const blocksAppendParams = {
     block_id: newPage.id,
     children: translatedBlocks,
@@ -429,24 +420,40 @@ async function createNewPageForTranslation(originalPage) {
     );
   }
 
-  const pageSize = 10;
-  let beginIndex = 0;
-  let endIndex = 0;
-  do {
-    beginIndex = endIndex;
-    endIndex = (beginIndex + pageSize) < translatedBlocks.length ? beginIndex + pageSize : translatedBlocks.length;
-    const reducedBlocks = translatedBlocks.slice(beginIndex, endIndex);
+  // const pageSize = 10;
+  // let beginIndex = 0;
+  // let endIndex = 0;
+  // do {
+  //   beginIndex = endIndex;
+  //   endIndex = (beginIndex + pageSize) < translatedBlocks.length ? beginIndex + pageSize : translatedBlocks.length;
+  //   const reducedBlocks = translatedBlocks.slice(beginIndex, endIndex);
 
-    const blocksAppendParams = {
-      block_id: newPage.id,
-      children: reducedBlocks,
-    };
+  //   const blocksAppendParams = {
+  //     block_id: newPage.id,
+  //     children: reducedBlocks,
+  //   };
 
-    const blocksAddition = await notion.blocks.children.append(blocksAppendParams);
-    if (debug) {
-      console.log(`Block creation response: ${toPrettifiedJSON(blocksAddition)}`);
+  //   const blocksAddition = await notion.blocks.children.append(blocksAppendParams);
+  //   if (debug) {
+  //     console.log(`Block creation response: ${toPrettifiedJSON(blocksAddition)}`);
+  //   }
+  // } while(endIndex < translatedBlocks.length);
+
+
+  for (const block of translatedBlocks) {
+    if (block.type === "child_database") {
+      await duplicateDatabase(block.internal_db_id, newPage.id);
+    } else {
+      const blocksAppendParams = {
+        block_id: newPage.id,
+        children: [block],
+      };
+      const blocksAddition = await notion.blocks.children.append(blocksAppendParams);
+      if (debug) {
+        console.log(`Block creation response: ${toPrettifiedJSON(blocksAddition)}`);
+      }
     }
-  } while(endIndex < translatedBlocks.length);
+  }
 
   console.log(
     "... Done!\n\nDisclaimer:\nSome parts might not be perfect.\nIf the generated page is missing something, please adjust the details on your own.\n"
@@ -454,3 +461,127 @@ async function createNewPageForTranslation(originalPage) {
   console.log(`Here is the translated Notion page:\n${newPage.url}\n`);
   open(newPage.url);
 })();
+
+async function duplicateDatabase(originalDatabaseId, parentId) {
+  if (parentId === undefined) {
+      console.log('ParentId is null. Abort.');
+      process.exit(1);
+  }
+  try {
+    // Retrieve the properties of the original database
+    const originalDatabase = await notion.databases.retrieve({
+      database_id: originalDatabaseId,
+    });
+    for (let key in originalDatabase.properties) {
+      let value = originalDatabase.properties[key];
+
+      if (value['type'] === 'multi_select') {
+        // Translating options ?
+        if (translationOfSelectOptions) {
+          for (let selectOption of value['multi_select'].options) {
+            const translated =  await translator.translateText(selectOption.name, from, to);
+            selectOption.name = translated.text;
+          }
+        }
+      } else if (value['type'] === 'rich_text') {
+          // Translating options ?
+          if (translationOfSelectOptions) {
+            console.log(value['rich_text']);
+            //await translateText(value, from, to);
+
+            // for (let selectOption of value['multi_select'].options) {
+            //   console.log(selectOption.name);
+            //   const translated =  await translator.translateText(selectOption.name, from, to);
+            //   selectOption.name = translated.text;
+            // }
+          }
+      }
+      for (let key2 in value) {
+        let value2 = value[key2];
+        if (key2 === 'name') {
+          const translated =  await translator.translateText(value2, from, to);
+          value[key2] = translated.text;
+        }
+        if (key2 === 'rich_text') {
+          console.log(`Rich text ${ value['name']}`);
+          //value[key2] = value['name'];
+        }
+
+      }
+    }
+
+    const duplicateDatabaseName =  originalDatabase.title[0].plain_text;
+
+    // Create a new database with the same properties as the original database
+    const newDatabase = await notion.databases.create({
+      parent: { page_id: parentId },
+      title: [{ text: { content: duplicateDatabaseName } }],
+      properties: originalDatabase.properties,
+    });
+    databases.push(newDatabase);
+
+    // Iterate through the pages in the original database
+    const originalPages = await notion.databases.query({
+      database_id: originalDatabaseId,
+    });
+
+    for (const originalPage of originalPages.results) {
+      const newPageS = JSON.parse(JSON.stringify(originalPage)); // Create a deep copy
+      removeUnecessaryProperties(newPageS);
+
+      newPageS.parent.database_id = newDatabase.id;
+      for (let key in newPageS.properties) {
+        let value =  newPageS.properties[key];
+        for (let key2 in value) {
+          let value2 = value[key2];
+          if (key2 === 'id') {
+            value[key2] = undefined;
+          }
+          if (key2 === 'select') {
+            for (let keyOfSelect in value[key2]) {
+              if (keyOfSelect !== 'name') {
+                value[key2][keyOfSelect] = undefined;
+              } else {
+                const translated =  await translator.translateText(value[key2][keyOfSelect], from, to);
+                  value[key2][keyOfSelect] = translated.text;
+              }
+            }
+          }
+          else if (key2 === 'multi_select') {
+            for (let keyOfSelect in value[key2]) {
+              let selectedValue =  value[key2][keyOfSelect];
+              for (let properties in selectedValue) {
+                if (properties !== 'name') {
+                  selectedValue[properties] = undefined;
+                } else {
+                  const translated =  await translator.translateText(selectedValue[properties], from, to);
+                  selectedValue[properties] = translated.text;
+                }
+              }
+            }
+          } else if (key2 === 'rich_text') {
+            if (value[key2][0] !== undefined) {
+              const translated =  await translator.translateText(value[key2][0]['text']['content'], from, to);
+              value[key2][0]['text']['content'] = translated.text;
+            }
+          } else if (key2 === 'title') {
+            const translated =  await translator.translateText(value[key2][0]['plain_text'], from, to);
+            value[key2][0]['text']['content'] = translated.text;
+          }
+        }
+      }
+
+      // Create a new page in the duplicate database
+      const newPage = await notion.pages.create(
+        {
+        parent: { database_id: newDatabase.id},
+          properties : newPageS.properties
+        },
+
+      );
+      console.log(`Created new page with ID ${newPage.id}`);
+    }
+  } catch (error) {
+    console.error(error);
+  }
+}
