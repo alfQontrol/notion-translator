@@ -359,11 +359,14 @@ async function buildTranslatedBlocks(id, newPage, nestedDepth) {
 async function createNewPageForTranslation(originalPage) {
   const newPage = JSON.parse(JSON.stringify(originalPage)); // Create a deep copy
   // Create the translated page as a child of the original page
-  newPage.parent = { page_id: originalPage.id };
+  //newPage.parent = { page_id: originalPage.id };
+  newPage.parent = { page_id: originalPage.parent.page_id };
   const originalTitle = originalPage.properties.title ? originalPage.properties.title.title[0] : "Translated page";
+  const translatedTitleContent = await translator.translateText(originalTitle.text.content, from, to);
+  const translatedTitlePlainText = await translator.translateText(originalTitle.plain_text, from, to);
   const newTitle = newPage.properties.title.title[0];
-  newTitle.text.content = originalTitle.text.content + ` (${to})`;
-  newTitle.plain_text = originalTitle.plain_text + ` (${to})`;
+  newTitle.text.content = translatedTitleContent.text + ` (${to})`;
+  newTitle.plain_text = translatedTitlePlainText.text + ` (${to})`;
   removeUnecessaryProperties(newPage);
 
   if (debug) {
